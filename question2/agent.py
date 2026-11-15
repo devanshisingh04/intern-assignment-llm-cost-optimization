@@ -1,15 +1,14 @@
+
 from __future__ import annotations
 
 import json
-import uuid
+import re
 from dataclasses import dataclass
 
 from shared.billing import CostSession
-from shared.kb import expanded_help_center_blob, title_index
+from shared.kb import article_ids, load_article
 from shared.llm import ChatMessage, LlmClient
 from shared.tools import format_thread, get_order, get_ticket
-
-from question1.agent import parse_resolution
 
 
 @dataclass
@@ -19,115 +18,93 @@ class TicketResolution:
 
 
 class SupportPipeline:
-    """Same product as Question 1 — triage, retrieve, compose, audit."""
 
     def __init__(self, session: CostSession | None = None):
         self.session = session or CostSession()
         self.llm = LlmClient(self.session)
-        self.help_center = expanded_help_center_blob()
 
     def handle_ticket(self, ticket_id: str) -> TicketResolution:
         ticket = get_ticket(ticket_id)
         order = get_order(ticket["order_id"])
         thread = format_thread(ticket)
-        snapshot = json.dumps(order, indent=2)
+        snapshot = json.dumps(order, separators=(",", ":"))
 
-        triage = self._triage(ticket_id, thread, snapshot)
-        retrieved = self._retrieve(triage, snapshot)
-        draft = self._compose(ticket_id, thread, snapshot, triage, retrieved)
-        final = self._audit(ticket_id, thread, snapshot, triage, retrieved, draft)
-        parsed = parse_resolution(final)
-        return TicketResolution(parsed.action, parsed.kb_article)
+        # Node 1: Triage
+        triage = self._triage(ticket_id, thread)
 
-    def _triage(self, ticket_id: str, thread: str, snapshot: str) -> str:
-        messages = [
-            ChatMessage(
-                "system",
-                "\n".join(
-                    [
-                        f"trace-{uuid.uuid4()}",
-                        "Triage node: restate the ticket step by step and list candidate kb articles.",
-                        f"ARTICLE TITLES:\n{title_index(500)}",
-                        self.help_center[:120_000],
-                    ]
-                ),
-            ),
-            ChatMessage(
-                "user",
-                f"TICKET {ticket_id}\nTHREAD:\n{thread}\nORDER_SNAPSHOT:\n{snapshot}\nEND_SNAPSHOT",
-            ),
-        ]
-        return self.llm.chat("triage", messages)
+        # Node 2: Retrieve
+        retrieved = self._retrieve(triage)
 
-    def _retrieve(self, triage: str, snapshot: str) -> str:
-        messages = [
-            ChatMessage(
-                "system",
-                "Retrieve node: print full text of the eight most relevant help articles.",
-            ),
-            ChatMessage(
-                "user",
-                f"TRIAGE:\n{triage}\nORDER_SNAPSHOT:\n{snapshot}\nEND_SNAPSHOT",
-            ),
-        ]
-        return self.llm.chat("retrieve", messages)
+        # Node 3: Compose
+        draft = self._compose(
+            ticket_id, thread, snapshot, retrieved
+        )
+
+        # Node 4: Audit
+        return self._audit(draft)
+
+    def _triage(self, ticket_id: str, thread: str) -> str:
+        return f"TICKET: {ticket_id}\nTHREAD:\n{thread}"
+
+    def _retrieve(self, triage: str) -> str:
+        text = triage.lower()
+
+        if any(word in text for word in ["custom", "personalized"]):
+            article = "custom-items-no-replace"
+
+        elif any(word in text for word in ["license", "ebook", "digital"]):
+            article = "digital-license-no-refund"
+
+        elif any(word in text for word in ["damaged", "cracked", "broken"]):
+            article = "damage-replacement-7-days"
+
+        elif any(word in text for word in ["subscription", "annual"]):
+            article = "subscription-cooling-off"
+
+        else:
+            article = "returns-within-30-days"
+
+        return f"ARTICLE: {article}\n{load_article(article)}"
 
     def _compose(
         self,
         ticket_id: str,
         thread: str,
         snapshot: str,
-        triage: str,
         retrieved: str,
     ) -> str:
+
         messages = [
             ChatMessage(
                 "system",
-                "Compose node: full reasoning, then JSON with action, kb_article, customer_reply.",
+                "You are ShopAssist. Use the ticket, order facts, "
+                "and supplied policy. Return compact JSON containing "
+                "action, kb_article, and customer_reply."
             ),
             ChatMessage(
                 "user",
-                "\n\n".join(
-                    [
-                        f"TICKET {ticket_id}",
-                        f"THREAD:\n{thread}",
-                        f"ORDER_SNAPSHOT:\n{snapshot}\nEND_SNAPSHOT",
-                        f"TRIAGE:\n{triage}",
-                        f"ARTICLES:\n{retrieved}",
-                        f"TRIAGE AGAIN:\n{triage}",
-                    ]
-                ),
+                f"TICKET: {ticket_id}\n"
+                f"THREAD:\n{thread}\n"
+                f"POLICY:\n{retrieved}\n"
+                f"ORDER_SNAPSHOT:\n{snapshot}\n"
+                "END_SNAPSHOT"
             ),
         ]
+
         return self.llm.chat("compose", messages)
 
-    def _audit(
-        self,
-        ticket_id: str,
-        thread: str,
-        snapshot: str,
-        triage: str,
-        retrieved: str,
-        draft: str,
-    ) -> str:
-        messages = [
-            ChatMessage(
-                "system",
-                "Audit node: double-check policy, restate ticket, rewrite JSON output.",
-            ),
-            ChatMessage(
-                "user",
-                "\n\n".join(
-                    [
-                        self.help_center[:80_000],
-                        f"TICKET {ticket_id}",
-                        f"THREAD:\n{thread}",
-                        f"ORDER_SNAPSHOT:\n{snapshot}\nEND_SNAPSHOT",
-                        f"DRAFT:\n{draft}",
-                        f"TRIAGE:\n{triage}",
-                        f"ARTICLES:\n{retrieved}",
-                    ]
-                ),
-            ),
-        ]
-        return self.llm.chat("audit", messages)
+    def _audit(self, draft: str) -> TicketResolution:
+        match = re.search(r"\{[\s\S]*\}", draft)
+
+        if not match:
+            raise ValueError("Invalid JSON response")
+
+        data = json.loads(match.group())
+
+        action = str(data["action"]).upper()
+        article = str(data["kb_article"])
+
+        if article not in article_ids():
+            raise ValueError(f"Unknown KB article: {article}")
+
+        return TicketResolution(action, article)
